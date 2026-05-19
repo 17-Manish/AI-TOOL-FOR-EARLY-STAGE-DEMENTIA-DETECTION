@@ -46,6 +46,62 @@ def _load_models():
         print("    Running in HEURISTIC mode (no .pkl loaded).")
  
 _load_models()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# QUESTION VARIANT BANKS  (6 sets — picked randomly per assessment)
+# Backend scores against the correct answers for the set that was used.
+# Frontend sends sessionMeta.setIdx so we know which set to check against.
+# ──────────────────────────────────────────────────────────────────────────────
+
+MATH_VARIANTS = [
+    {"q": "₹1000 budget: apples ₹200, tricycle ₹500",  "spent": "700",  "rem": "300"},
+    {"q": "₹800 budget: bag ₹350, bottle ₹150",         "spent": "500",  "rem": "300"},
+    {"q": "₹1200 budget: vegetables ₹450, medicine ₹300","spent": "750",  "rem": "450"},
+    {"q": "₹600 budget: book ₹120, pen set ₹80",        "spent": "200",  "rem": "400"},
+    {"q": "₹2000 budget: phone repair ₹900, groceries ₹350","spent":"1250","rem":"750"},
+    {"q": "₹500 budget: shirt ₹180, socks ₹70",         "spent": "250",  "rem": "250"},
+]
+
+MEMORY_VARIANTS = [
+    ["apple","pen","tie","house","car"],
+    ["flower","watch","book","cake","fish"],
+    ["lemon","key","hat","magnet","moon"],
+    ["grapes","scissors","guitar","globe","elephant"],
+    ["coconut","bulb","target","wave","trophy"],
+    ["mango","clock","umbrella","chair","train"],
+]
+
+CLOCK_VARIANTS = [
+    {"display": "10:50",  "h_target": 330, "m_target": 300},
+    {"display": "3:15",   "h_target": 97,  "m_target": 90},
+    {"display": "6:30",   "h_target": 195, "m_target": 180},
+    {"display": "9:00",   "h_target": 270, "m_target": 0},
+    {"display": "12:45",  "h_target": 22,  "m_target": 270},
+    {"display": "7:20",   "h_target": 220, "m_target": 120},
+]
+
+SHAPE_VARIANTS = [
+    {"identify": "triangle", "largest": "circle"},
+    {"identify": "circle",   "largest": "triangle"},
+    {"identify": "square",   "largest": "circle"},
+    {"identify": "triangle", "largest": "square"},
+    {"identify": "circle",   "largest": "square"},
+    {"identify": "square",   "largest": "triangle"},
+]
+
+STORY_VARIANTS = [
+    {"answers": ["market", "three", "bus"]},
+    {"answers": ["hospital", "two hours", "auto"]},
+    {"answers": ["library", "four", "Mrs Sharma"]},
+    {"answers": ["railway station", "Chennai", "sister"]},
+    {"answers": ["Sunday", "five", "television"]},
+    {"answers": ["park", "six", "bicycle"]},
+]
+
+FLUENCY_VARIANTS = [
+    "animals", "fruits", "vegetables", "countries", "sports", "colours"
+]
+
  
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.  DATABASE
@@ -76,6 +132,18 @@ def _init_db():
             token      TEXT PRIMARY KEY,
             user_id    INTEGER,
             expires_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS game_scores (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            game_name   TEXT NOT NULL,
+            score       INTEGER DEFAULT 0,
+            moves       INTEGER DEFAULT 0,
+            time_secs   INTEGER DEFAULT 0,
+            difficulty  TEXT,
+            theme       TEXT,
+            played_at   TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(user_id) REFERENCES users(id)
         );
         CREATE TABLE IF NOT EXISTS assessments (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -390,15 +458,36 @@ def _risk_level(overall_risk: float) -> str:
  
  
 def _compute_scores(pred: dict, cog_answers: dict,
-                    total_words: int = 50, tasks_completed: int = 3) -> dict:
+                    total_words: int = 50, tasks_completed: int = 3,
+                    session_meta: dict = None) -> dict:
     """
     Combine ML probability with cognitive-test answers to produce
     speechScore / cognitiveScore / overallRisk.
 
     total_words:      total words spoken across all 3 tasks
     tasks_completed:  how many tasks had >= 5 words spoken
+    session_meta:     variant indices from frontend (setIdx etc.)
     """
     p_dem = pred["dementia_probability"]
+    if session_meta is None:
+        session_meta = {}
+
+    # Get the variant set index (default 0 = original questions)
+    set_idx = int(session_meta.get("setIdx", 0)) % 6
+
+    # Load correct answers for this set
+    math_correct  = MATH_VARIANTS[set_idx]
+    mem_targets   = MEMORY_VARIANTS[set_idx]
+    clock_correct = CLOCK_VARIANTS[set_idx]
+    shape_correct = SHAPE_VARIANTS[set_idx]
+    story_correct = STORY_VARIANTS[set_idx]["answers"]
+
+    print(f"📋  Scoring set_idx={set_idx}: "
+          f"math_spent={math_correct['spent']}, "
+          f"memory={mem_targets[:2]}, "
+          f"clock={clock_correct['display']}, "
+          f"shape_id={shape_correct['identify']}, "
+          f"story={story_correct}")
 
     # ── Speech risk based on task completion ─────────────────────────────────
     # ML model on sparse/zero vector gives ~0.44 which is misleading.
@@ -445,12 +534,16 @@ def _compute_scores(pred: dict, cog_answers: dict,
     if str(cog_answers.get("location","")).strip():
         cog_correct += 1
  
-    # Math — spent=700, remaining=300
+    # Math — dynamic correct answers based on variant
     cog_total += 2
-    if str(cog_answers.get("mathSpent","")).strip() == "700":
+    if str(cog_answers.get("mathSpent","")).strip() == math_correct["spent"]:
         cog_correct += 1
-    if str(cog_answers.get("mathRemaining","")).strip() == "300":
+    elif str(cog_answers.get("mathSpent","")).strip():
+        cog_correct += 0.2  # attempted but wrong
+    if str(cog_answers.get("mathRemaining","")).strip() == math_correct["rem"]:
         cog_correct += 1
+    elif str(cog_answers.get("mathRemaining","")).strip():
+        cog_correct += 0.2  # attempted but wrong
  
     # Animal fluency
     cog_total += 1
@@ -460,38 +553,45 @@ def _compute_scores(pred: dict, cog_answers: dict,
     elif unique_animals >= 10: cog_correct += 0.75
     elif unique_animals >= 5:  cog_correct += 0.5
  
-    # Object recall
+    # Object recall — dynamic targets based on variant
     cog_total += 1
-    targets = ["apple","pen","tie","house","car"]
     recalled = sum(
         1 for r in cog_answers.get("objectRecall", [])
-        if any(t in str(r).lower() for t in targets)
+        if any(t.lower() in str(r).lower() for t in mem_targets)
     )
     cog_correct += recalled / 5.0
+    print(f"    Memory recalled={recalled}/5 (targets={mem_targets})")
  
-    # Clock
+    # Clock — dynamic target time based on variant
     cog_total += 1
     h_ang = cog_answers.get("clockHourAngle", 0)
     m_ang = cog_answers.get("clockMinuteAngle", 0)
-    h_target, m_target = 330, 300
+    h_target = clock_correct["h_target"]
+    m_target = clock_correct["m_target"]
     hd = abs(((h_ang % 360) + 360) % 360 - h_target)
     md = abs(((m_ang % 360) + 360) % 360 - m_target)
-    if hd < 30 and md < 30:   cog_correct += 1.0
-    elif hd < 60 and md < 60: cog_correct += 0.5
+    if hd < 30 and md < 30:        cog_correct += 1.0
+    elif hd < 60 and md < 60:      cog_correct += 0.7
+    elif h_ang != 0 or m_ang != 0: cog_correct += 0.3  # attempted
+    print(f"    Clock: given=({h_ang:.0f},{m_ang:.0f}) target=({h_target},{m_target}) hd={hd:.0f} md={md:.0f}")
  
-    # Shape
+    # Shape — dynamic correct shape based on variant
     cog_total += 1
-    if cog_answers.get("shapeClicked") == "triangle": cog_correct += 0.5
-    if cog_answers.get("largestShape",""):             cog_correct += 0.5
+    if cog_answers.get("shapeClicked") == shape_correct["identify"]: cog_correct += 0.5
+    if cog_answers.get("largestShape") == shape_correct["largest"]:  cog_correct += 0.5
+    elif cog_answers.get("largestShape",""):                          cog_correct += 0.2
+    print(f"    Shape: id_given={cog_answers.get('shapeClicked')} id_correct={shape_correct['identify']} "
+          f"big_given={cog_answers.get('largestShape')} big_correct={shape_correct['largest']}")
  
-    # Story
+    # Story — dynamic correct answers based on variant
     cog_total += 1
-    sa  = cog_answers.get("storyAnswers", [])
-    cog_correct += (
-        (1 if len(sa) > 0 and sa[0] == "market" else 0) +
-        (1 if len(sa) > 1 and sa[1] == "three"  else 0) +
-        (1 if len(sa) > 2 and sa[2] == "bus"    else 0)
-    ) / 3.0
+    sa = cog_answers.get("storyAnswers", [])
+    story_score = sum(
+        1 for i, correct in enumerate(story_correct)
+        if i < len(sa) and str(sa[i]).lower().strip() == correct.lower().strip()
+    )
+    cog_correct += story_score / max(len(story_correct), 1)
+    print(f"    Story: given={sa} correct={story_correct} score={story_score}/{len(story_correct)}")
  
     cog_pct = (cog_correct / max(cog_total, 1)) * 100   # 0-100, higher=better
  
@@ -722,10 +822,14 @@ def assess():
           f"[{prediction['model_used']}]")
 
     # ── Compute final scores ──────────────────────────────────────────────────
+    session_meta = body.get("sessionMeta", {})
+    print(f"📋  Session meta received: setIdx={session_meta.get('setIdx','not set')}")
+
     scores = _compute_scores(
         prediction, cog_answers,
         total_words=total_words_spoken,
-        tasks_completed=tasks_completed
+        tasks_completed=tasks_completed,
+        session_meta=session_meta
     )
  
     # ── Build response matching frontend TestResult interface ─────────────────
@@ -821,6 +925,54 @@ def nearby_doctors():
     return jsonify({"doctors": doctors, "location": loc})
  
  
+# ── Game Scores ───────────────────────────────────────────────────────────────
+@app.route("/api/game-score", methods=["POST"])
+@auth_required
+def save_game_score():
+    uid = request.current_user["id"]
+    d   = request.json or {}
+    with _db() as db:
+        db.execute(
+            "INSERT INTO game_scores(user_id,game_name,score,moves,time_secs,difficulty,theme) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (uid, d.get("gameName",""), d.get("score",0), d.get("moves",0),
+             d.get("timeSecs",0), d.get("difficulty",""), d.get("theme",""))
+        )
+    return jsonify({"status": "saved"})
+
+
+@app.route("/api/game-scores", methods=["GET"])
+@auth_required
+def get_game_scores():
+    uid = request.current_user["id"]
+    game = request.args.get("game", "")
+    with _db() as db:
+        query = "SELECT * FROM game_scores WHERE user_id=?"
+        params = [uid]
+        if game:
+            query += " AND game_name=?"
+            params.append(game)
+        query += " ORDER BY played_at DESC LIMIT 20"
+        rows = db.execute(query, params).fetchall()
+    return jsonify({
+        "scores": [dict(r) for r in rows]
+    })
+
+
+@app.route("/api/game-leaderboard", methods=["GET"])
+@auth_required
+def game_leaderboard():
+    game = request.args.get("game", "memory")
+    with _db() as db:
+        rows = db.execute(
+            "SELECT u.full_name, g.score, g.moves, g.time_secs, g.theme, g.played_at "
+            "FROM game_scores g JOIN users u ON g.user_id=u.id "
+            "WHERE g.game_name=? ORDER BY g.moves ASC, g.time_secs ASC LIMIT 10",
+            (game,)
+        ).fetchall()
+    return jsonify({"leaderboard": [dict(r) for r in rows]})
+
+
 # ── Catch-all OPTIONS for CORS preflight ─────────────────────────────────────
 @app.route("/api/<path:path>", methods=["OPTIONS"])
 def options_handler(path):
